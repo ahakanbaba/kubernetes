@@ -3,5 +3,6 @@ kind: Widget
 metadata:
   name: "widget"
   namespace: "test"
-key : "value"
-
+  labels:
+    foo: bar
+key: "value"

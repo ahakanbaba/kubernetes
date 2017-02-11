@@ -64,7 +64,8 @@ const (
 	filenameSVC   = "../../../test/fixtures/pkg/kubectl/cmd/apply/service.yaml"
 	filenameRCSVC = "../../../test/fixtures/pkg/kubectl/cmd/apply/rc-service.yaml"
 
-	filenameWidget = "../../../test/fixtures/pkg/kubectl/cmd/apply/widget.yaml"
+	filenameWidgetClientside = "../../../test/fixtures/pkg/kubectl/cmd/apply/widget-clientside.yaml"
+	filenameWidgetServerside = "../../../test/fixtures/pkg/kubectl/cmd/apply/widget-serverside.yaml"
 )
 
 func readBytesFromFile(t *testing.T, filename string) []byte {
@@ -109,7 +110,7 @@ func readReplicationControllerFromFile(t *testing.T, filename string) *api.Repli
 func readUnstructuredFromFile(t *testing.T, filename string) *unstructured.Unstructured {
 	data := readBytesFromFile(t, filename)
 	unst := unstructured.Unstructured{}
-	if err := runtime.DecodeInto(testapi.Extensions.Codec(), data, &unst); err != nil {
+	if err := runtime.DecodeInto(testapi.Default.Codec(), data, &unst); err != nil {
 		t.Fatal(err)
 	}
 	return &unst
@@ -125,23 +126,16 @@ func readServiceFromFile(t *testing.T, filename string) *api.Service {
 	return &svc
 }
 
-func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object, codec runtime.Codec) (string, []byte) {
+func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object, kind string) (string, []byte) {
 	originalAccessor, err := meta.Accessor(originalObj)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	originalLabels := originalAccessor.GetLabels()
-	if originalLabels != nil {
-		originalLabels["DELETE_ME"] = "DELETE_ME"
-		originalAccessor.SetLabels(originalLabels)
-	}
-
-	originalAnnotations := originalAccessor.GetAnnotations()
-	if originalAnnotations == nil {
-		originalAccessor.SetAnnotations(map[string]string{})
-	}
-	original, err := runtime.Encode(codec, originalObj)
+	originalLabels["DELETE_ME"] = "DELETE_ME"
+	originalAccessor.SetLabels(originalLabels)
+	original, err := runtime.Encode(testapi.Default.Codec(), originalObj)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,10 +149,9 @@ func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object,
 	if currentAnnotations == nil {
 		currentAnnotations = make(map[string]string)
 	}
-
 	currentAnnotations[annotations.LastAppliedConfigAnnotation] = string(original)
 	currentAccessor.SetAnnotations(currentAnnotations)
-	current, err := runtime.Encode(codec, currentObj)
+	current, err := runtime.Encode(testapi.Default.Codec(), currentObj)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,19 +162,19 @@ func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object,
 func readAndAnnotateReplicationController(t *testing.T, filename string) (string, []byte) {
 	rc1 := readReplicationControllerFromFile(t, filename)
 	rc2 := readReplicationControllerFromFile(t, filename)
-	return annotateRuntimeObject(t, rc1, rc2, testapi.Default.Codec())
+	return annotateRuntimeObject(t, rc1, rc2, "ReplicationController")
 }
 
 func readAndAnnotateService(t *testing.T, filename string) (string, []byte) {
 	svc1 := readServiceFromFile(t, filename)
 	svc2 := readServiceFromFile(t, filename)
-	return annotateRuntimeObject(t, svc1, svc2, testapi.Default.Codec())
+	return annotateRuntimeObject(t, svc1, svc2, "Service")
 }
 
 func readAndAnnotateUnstructured(t *testing.T, filename string) (string, []byte) {
 	obj1 := readUnstructuredFromFile(t, filename)
 	obj2 := readUnstructuredFromFile(t, filename)
-	return annotateRuntimeObject(t, obj1, obj2, testapi.Extensions.Codec())
+	return annotateRuntimeObject(t, obj1, obj2, "Widget")
 }
 
 func validatePatchApplication(t *testing.T, req *http.Request) {
@@ -557,11 +550,10 @@ func TestApplyNULLPreservation(t *testing.T) {
 	}
 }
 
-// TestApplyIdempotentTPREntry checks repeated apply operations on TPR entries
-// without any change.
-func TestApplyIdempotentTPREntry(t *testing.T) {
+// TestUnstructuredApply checks apply operations on an unstructured object
+func TestUnstructuredApply(t *testing.T) {
 	initTestErrorHandler(t)
-	name, curr := readAndAnnotateUnstructured(t, filenameWidget)
+	name, curr := readAndAnnotateUnstructured(t, filenameWidgetClientside)
 	path := "/namespaces/test/widgets/" + name
 
 	verifiedPatch := false
@@ -580,34 +572,11 @@ func TestApplyIdempotentTPREntry(t *testing.T) {
 					Header:     defaultHeader(),
 					Body:       body}, nil
 			case p == path && m == "PATCH":
-				// In idempotent updates, kubectl sends a logically empty
-				// request body with the PATCH request.
-				// Should look like this:
-				// Request Body: {"metadata":{"annotations":{}}}
-
-				patch, err := ioutil.ReadAll(req.Body)
-				if err != nil {
-					t.Fatal(err)
-				}
-
 				contentType := req.Header.Get("Content-Type")
 				if contentType != "application/merge-patch+json" {
-					t.Fatalf("Unexpected Content-Type: %s in patch: %s.", contentType, patch)
+					t.Fatalf("Unexpected Content-Type: %s", contentType)
 				}
-
-				patchMap := map[string]interface{}{}
-				if err := json.Unmarshal(patch, &patchMap); err != nil {
-					t.Fatal(err)
-				}
-				if len(patchMap) != 1 {
-					t.Fatalf("Unexpected Patch. Has more than 1 entry. path: %s", patch)
-				}
-
-				annotationsMap := walkMapPath(t, patchMap, []string{"metadata", "annotations"})
-				if len(annotationsMap) != 0 {
-					t.Fatalf("Unexpected Patch. Found unexpected annotation: %s", patch)
-				}
-
+				validatePatchApplication(t, req)
 				verifiedPatch = true
 
 				body := ioutil.NopCloser(bytes.NewReader(curr))
@@ -627,11 +596,98 @@ func TestApplyIdempotentTPREntry(t *testing.T) {
 	errBuf := bytes.NewBuffer([]byte{})
 
 	cmd := NewCmdApply(f, buf, errBuf)
-	cmd.Flags().Set("filename", filenameWidget)
+	cmd.Flags().Set("filename", filenameWidgetClientside)
 	cmd.Flags().Set("output", "name")
 	cmd.Run(cmd, []string{})
 
 	expected := "widget/" + name + "\n"
+	if buf.String() != expected {
+		t.Fatalf("unexpected output: %s\nexpected: %s", buf.String(), expected)
+	}
+	if !verifiedPatch {
+		t.Fatal("No server-side patch call detected")
+	}
+}
+
+// TestUnstructuredIdempotentApply checks repeated apply operation on an unstructured object
+func TestUnstructuredIdempotentApply(t *testing.T) {
+	initTestErrorHandler(t)
+
+	serversideObject := readUnstructuredFromFile(t, filenameWidgetServerside)
+	serversideData, err := runtime.Encode(testapi.Default.Codec(), serversideObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/namespaces/test/widgets/widget"
+
+	verifiedPatch := false
+
+	f, tf, _, _ := cmdtesting.NewAPIFactory()
+	tf.Printer = &testPrinter{}
+	tf.UnstructuredClient = &fake.RESTClient{
+		APIRegistry:          api.Registry,
+		NegotiatedSerializer: unstructuredSerializer,
+		Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch p, m := req.URL.Path, req.Method; {
+			case p == path && m == "GET":
+				body := ioutil.NopCloser(bytes.NewReader(serversideData))
+				return &http.Response{
+					StatusCode: 200,
+					Header:     defaultHeader(),
+					Body:       body}, nil
+			case p == path && m == "PATCH":
+				// In idempotent updates, kubectl sends a logically empty
+				// request body with the PATCH request.
+				// Should look like this:
+				// Request Body: {"metadata":{"annotations":{}}}
+
+				patch, err := ioutil.ReadAll(req.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				contentType := req.Header.Get("Content-Type")
+				if contentType != "application/merge-patch+json" {
+					t.Fatalf("Unexpected Content-Type: %s", contentType)
+				}
+
+				patchMap := map[string]interface{}{}
+				if err := json.Unmarshal(patch, &patchMap); err != nil {
+					t.Fatal(err)
+				}
+				if len(patchMap) != 1 {
+					t.Fatalf("Unexpected Patch. Has more than 1 entry. path: %s", patch)
+				}
+
+				annotationsMap := walkMapPath(t, patchMap, []string{"metadata", "annotations"})
+				if len(annotationsMap) != 0 {
+					t.Fatalf("Unexpected Patch. Found unexpected annotation: %s", patch)
+				}
+
+				verifiedPatch = true
+
+				body := ioutil.NopCloser(bytes.NewReader(serversideData))
+				return &http.Response{
+					StatusCode: 200,
+					Header:     defaultHeader(),
+					Body:       body}, nil
+			default:
+				t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
+				return nil, nil
+			}
+		}),
+	}
+
+	tf.Namespace = "test"
+	buf := bytes.NewBuffer([]byte{})
+	errBuf := bytes.NewBuffer([]byte{})
+
+	cmd := NewCmdApply(f, buf, errBuf)
+	cmd.Flags().Set("filename", filenameWidgetClientside)
+	cmd.Flags().Set("output", "name")
+	cmd.Run(cmd, []string{})
+
+	expected := "widget/widget\n"
 	if buf.String() != expected {
 		t.Fatalf("unexpected output: %s\nexpected: %s", buf.String(), expected)
 	}
