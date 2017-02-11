@@ -125,8 +125,7 @@ func readServiceFromFile(t *testing.T, filename string) *api.Service {
 	return &svc
 }
 
-func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object,
-	codec runtime.Codec) (string, []byte) {
+func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object, codec runtime.Codec) (string, []byte) {
 	originalAccessor, err := meta.Accessor(originalObj)
 	if err != nil {
 		t.Fatal(err)
@@ -136,6 +135,15 @@ func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object,
 	if originalLabels != nil {
 		originalLabels["DELETE_ME"] = "DELETE_ME"
 		originalAccessor.SetLabels(originalLabels)
+	}
+
+	originalAnnotations := originalAccessor.GetAnnotations()
+	if originalAnnotations == nil {
+		originalAccessor.SetAnnotations(map[string]string{})
+	}
+	original, err := runtime.Encode(codec, originalObj)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	currentAccessor, err := meta.Accessor(currentObj)
@@ -148,13 +156,7 @@ func annotateRuntimeObject(t *testing.T, originalObj, currentObj runtime.Object,
 		currentAnnotations = make(map[string]string)
 	}
 
-	originalAccessor.SetAnnotations(map[string]string{})
-	originalWithEmptyAnno, err := runtime.Encode(codec, originalObj)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	currentAnnotations[annotations.LastAppliedConfigAnnotation] = string(originalWithEmptyAnno)
+	currentAnnotations[annotations.LastAppliedConfigAnnotation] = string(original)
 	currentAccessor.SetAnnotations(currentAnnotations)
 	current, err := runtime.Encode(codec, currentObj)
 	if err != nil {
